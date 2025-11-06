@@ -1,0 +1,181 @@
+name: Terraform Deploy
+
+on:
+  push:
+    branches: [main, develop, staging]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '**.hcl'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '**.hcl'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      action:
+        description: 'Terraform action'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+env:
+  TF_VERSION: '1.6.0'
+  AWS_REGION: 'us-west-2'
+
+jobs:
+  determine-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      should_apply: ${{ steps.env.outputs.should_apply }}
+    steps:
+      - name: Determine Environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "should_apply=${{ github.event.inputs.action == 'apply' }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "should_apply=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "should_apply=true" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "should_apply=true" >> $GITHUB_OUTPUT
+          fi
+
+  terraform:
+    needs: determine-environment
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Make scripts executable
+        run: |
+          chmod +x ci-cd/scripts/*.sh
+
+      - name: Terraform Lint & Validation
+        run: |
+          ./ci-cd/scripts/terraform-validate.sh
+
+      - name: Security Scan with tfsec
+        run: |
+          # Install tfsec
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+          
+          # Run security scan
+          tfsec . --format sarif --out tfsec-results.sarif || true
+          
+        continue-on-error: true
+
+      - name: Upload tfsec results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: tfsec-results.sarif
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          ./ci-cd/scripts/terraform-plan.sh ${{ needs.determine-environment.outputs.environment }}
+        continue-on-error: true
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const environment = '${{ needs.determine-environment.outputs.environment }}';
+            
+            try {
+              const planOutput = fs.readFileSync(`plan-output-${environment}.txt`, 'utf8');
+              const comment = `## Terraform Plan for \`${environment}\`
+              
+              <details>
+              <summary>Show Plan</summary>
+              
+              \`\`\`
+              ${planOutput}
+              \`\`\`
+              
+              </details>`;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            } catch (error) {
+              console.log('Could not read plan output file');
+            }
+
+      - name: Terraform Apply
+        if: |
+          needs.determine-environment.outputs.should_apply == 'true' && 
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          steps.plan.outcome == 'success'
+        run: |
+          ./ci-cd/scripts/terraform-apply.sh ${{ needs.determine-environment.outputs.environment }}
+
+      - name: Upload Plan Artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan-${{ needs.determine-environment.outputs.environment }}
+          path: |
+            tfplan-*
+            plan-output-*.txt
+            apply-result-*.txt
+          retention-days: 30
+
+  notify:
+    needs: [determine-environment, terraform]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify Success
+        if: needs.terraform.result == 'success'
+        run: |
+          echo "✅ Terraform deployment successful for ${{ needs.determine-environment.outputs.environment }}"
+          # Add notification logic (Slack, Teams, etc.)
+
+      - name: Notify Failure
+        if: needs.terraform.result == 'failure'
+        run: |
+          echo "❌ Terraform deployment failed for ${{ needs.determine-environment.outputs.environment }}"
+          # Add notification logic (Slack, Teams, etc.)

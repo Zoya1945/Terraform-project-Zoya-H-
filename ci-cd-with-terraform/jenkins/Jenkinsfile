@@ -1,0 +1,146 @@
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Select environment to deploy'
+        )
+        choice(
+            name: 'ACTION',
+            choices: ['plan', 'apply', 'destroy'],
+            description: 'Select Terraform action'
+        )
+    }
+    
+    environment {
+        AWS_DEFAULT_REGION = 'us-west-2'
+        TF_VAR_environment = "${params.ENVIRONMENT}"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Terraform Lint & Validation') {
+            steps {
+                script {
+                    sh '''
+                        echo "Running Terraform lint and validation..."
+                        ./ci-cd/scripts/terraform-validate.sh
+                    '''
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                script {
+                    sh '''
+                        echo "Running security scan..."
+                        # Install tfsec if not available
+                        if ! command -v tfsec &> /dev/null; then
+                            curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+                        fi
+                        tfsec . --format json --out tfsec-results.json || true
+                    '''
+                }
+                publishHTML([
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: '.',
+                    reportFiles: 'tfsec-results.json',
+                    reportName: 'TFSec Security Report'
+                ])
+            }
+        }
+        
+        stage('Terraform Plan') {
+            steps {
+                script {
+                    sh '''
+                        echo "Running Terraform plan for ${ENVIRONMENT}..."
+                        ./ci-cd/scripts/terraform-plan.sh ${ENVIRONMENT}
+                    '''
+                }
+                archiveArtifacts artifacts: 'tfplan-${ENVIRONMENT}', fingerprint: true
+            }
+        }
+        
+        stage('Approval') {
+            when {
+                anyOf {
+                    expression { params.ENVIRONMENT == 'prod' }
+                    expression { params.ACTION == 'apply' }
+                    expression { params.ACTION == 'destroy' }
+                }
+            }
+            steps {
+                script {
+                    def userInput = input(
+                        id: 'userInput',
+                        message: "Review the plan and approve ${params.ACTION} for ${params.ENVIRONMENT}",
+                        parameters: [
+                            choice(
+                                choices: ['Approve', 'Reject'],
+                                description: 'Approve or Reject the deployment',
+                                name: 'approval'
+                            )
+                        ]
+                    )
+                    
+                    if (userInput != 'Approve') {
+                        error("Deployment rejected by user")
+                    }
+                }
+            }
+        }
+        
+        stage('Terraform Apply') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                script {
+                    sh '''
+                        echo "Applying Terraform changes for ${ENVIRONMENT}..."
+                        ./ci-cd/scripts/terraform-apply.sh ${ENVIRONMENT}
+                    '''
+                }
+            }
+        }
+        
+        stage('Terraform Destroy') {
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+            steps {
+                script {
+                    sh '''
+                        echo "Destroying Terraform infrastructure for ${ENVIRONMENT}..."
+                        ./ci-cd/scripts/terraform-destroy.sh ${ENVIRONMENT}
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            echo "Pipeline completed successfully!"
+            // Send success notification
+        }
+        failure {
+            echo "Pipeline failed!"
+            // Send failure notification
+        }
+    }
+}
